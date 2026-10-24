@@ -72,12 +72,14 @@ Phase structure in the notebook. Each phase has caching so a kernel restart repl
 
 | Phase | Cells | Produces | Cache | Time (cold) |
 |---|---|---|---|---|
-| 1 — Setup | 1A-1E | config, `CARRIER_RULES`, `_DATA_VINTAGE`, `DATA_PROVIDER_MAP`, `dot_features` DuckDB table | `vintage_and_provider_map.pkl` + DuckDB file | ~10 min |
-| 2 — Aggregates | 2A-2F | `carrier_lookup`, `recent_events`, `service_composite`, `carrier_state_agg`, `dot_cell_contrib`, `sub_entity_centroids`, `dot_subent_contrib`, `dot_df` (pandas) | DuckDB tables + `dot_df.parquet` | ~15 min |
-| 3 — Training | 3A-3C | `MODELS` (4 LightGBM boosters, one per line) | `models.pkl` (joblib) | ~5 min |
-| 4 — Scoring + Validation | 4A-4J | `SCORED`, `OBS_RANK`, feature importance, error analysis, known-good/known-bad audit, weighted-tier retrain + comparison, calibration, pool-size scatter, synthetic DOT, temporal check | `scored_obs_rank.pkl` + `models_weighted.pkl` + `scored_obs_rank_weighted.pkl` + `line_tenure.pkl` | ~35 min |
-| 5 — Deliverable | 5A-5B | `long_ranked`, Option B sub-entity attached, `rosella_*_v3.csv` output | — | ~10 min |
-| 6 — Market analysis | 6A-6C | CA/TX market structure, carrier momentum, appetite-outlier call sheet | — | ~1 min |
+| 1 — Setup, Carrier Consolidation & Feature Build | 1A-1C, 1E | config, `CARRIER_RULES`, `_DATA_VINTAGE`, `DATA_PROVIDER_MAP`, `dot_features` DuckDB table | `vintage_and_provider_map.pkl` + DuckDB file | ~10 min |
+| 2 — Aggregates, Centroids & Scorable DOTs | 2A-2E | `carrier_lookup`, `recent_events`, `service_composite`, `carrier_state_agg`, `dot_cell_contrib`, `sub_entity_centroids`, `dot_subent_contrib`, `dot_df` (pandas) | DuckDB tables + `dot_df.parquet` | ~15 min |
+| **3 — EDA & Data Quality (new)** | 1D sanity check, 2F placement counts | print-only diagnostics | — | <1 min |
+| 4 — Model Training | 3A-3C | `MODELS` (4 LightGBM boosters, one per line) | `models.pkl` (joblib) | ~5 min |
+| 5 — Scoring & Validation | 4A-4K | `SCORED`, `OBS_RANK`, feature importance, error analysis, known-good/known-bad audit, weighted-tier retrain + comparison, calibration, pool-size scatter, synthetic DOT, temporal validation (approximate), true temporal train/test split | `scored_obs_rank.pkl`, `models_weighted.pkl`, `scored_obs_rank_weighted.pkl`, `line_tenure.pkl`, `models_temporal.pkl`, `results_temporal.pkl` | ~50 min |
+| 6 — Deliverables | 5A-5B | `long_ranked`, Option B sub-entity attached, `rosella_*_v3.csv` output | — | ~10 min |
+| 7 — Market analysis | 6A-6C | CA/TX market structure, carrier momentum, appetite-outlier call sheets | — | ~1 min |
+| 8 — Recommendation hygiene & multi-line analysis | 7A, 7B | Multi-line bundling analysis + hygiene post-processing (`*_hygiene.csv`) | — | ~2 min |
 
 ### 4.1 Memory architecture
 
@@ -490,12 +492,14 @@ Set `MODEL_FOR_DELIVERABLE` in cell 1A to `'base'` or `'weighted'`. Re-run cell 
 |---|---|---|
 | 1-5 | — | Imports, DuckDB connect, cache helpers, raw CSV view |
 | 6-19 | — | Earlier EDA / discovery (not required for v3) |
-| 21-25 | **Phase 1** | Setup, carrier consolidation rules, data vintage, dot_features table |
-| 27-32 | **Phase 2** | Aggregates, centroids, scorable-DOTs, derived features, placement count diagnostic |
-| 34-36 | **Phase 3** | Feature definitions, placement extraction, LightGBM training (4 models) |
-| 38-47 | **Phase 4** | Scoring, baselines, feature importance, error analysis, known-good/known-bad, weighted-tier retrain, weighted comparison, calibration, pool-size, synthetic DOT, temporal |
-| 49-50 | **Phase 5** | Combine, Option B sub-entity, deliverable CSVs |
-| 52-54 | **Phase 6** | CA / TX market structure, carrier momentum, appetite-outlier call sheets |
+| 20 (md), 21-24 | **Phase 1** | Setup, carrier consolidation rules, data vintage, dot_features table (1A-1C, 1E) |
+| 25 (md), 26-30 | **Phase 2** | Aggregates, centroids, scorable-DOTs, derived features (2A-2E) |
+| 31 (md), 32-33 | **Phase 3** | **EDA & Data Quality** — sanity check (1D), placement count diagnostic (2F) |
+| 34 (md), 35-37 | **Phase 4** | Feature definitions + training helpers, placement extraction, LightGBM training |
+| 38 (md), 39-49 | **Phase 5** | Scoring, baselines, feature importance, error analysis, known-good/known-bad, weighted-tier retrain, weighted comparison, calibration, pool-size, synthetic DOT, approximate temporal, true temporal train/test split |
+| 50 (md), 51-52 | **Phase 6** | Combine, Option B sub-entity, deliverable CSVs |
+| 53 (md), 54-56 | **Phase 7** | CA / TX market structure, carrier momentum, appetite-outlier call sheets |
+| 57 (md), 58-59 | **Phase 8** | Multi-line bundling analysis, recommendation-hygiene post-processing (hygiene CSVs) |
 
 ---
 
