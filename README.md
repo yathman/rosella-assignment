@@ -816,27 +816,37 @@ We measure *carrier appetite* as a proxy for appropriateness. See §2.3 for the 
 
 With 2-5 carriers per state for cargo and 3-10 for surety_bond, top-5 hit rates saturate regardless of model quality. Treat these lines as supplementary — primary deliverable value is BIPD and WC.
 
-### 8.3 Peer leakage (bounded)
+### 8.3 Peer leakage in standard CV is larger than a simple LOO bound suggests
 
-LOO adjustment removes a DOT's own contribution from carrier aggregates. Peer DOTs placed with the same carrier are still in the aggregate. This inflates CV ROC-AUC vs true out-of-sample generalisation. Bounded by `MIN_CARRIER_PLACEMENTS`: ~5-10% self-correlation per cell.
+LOO adjustment removes **a DOT's own contribution** from carrier aggregates, which fixes self-leakage. It does **not** fix fold-peer leakage: in GroupKFold, if a 100-DOT carrier splits ~33/67 across folds, the aggregates built in Phase 2 (over the full 24m) include all 100 DOTs. The model trains on 67 of them with features that reflect the influence of the other 33 (minus each DOT's own contribution). CV metrics therefore overstate out-of-sample performance by more than the ~5-10% self-correlation bound alone would suggest.
+
+The proper fix is **per-fold aggregate rebuilding** — recompute `carrier_state_agg` using only the fold's training DOTs. This is expensive (K× the aggregate build) and not applied in standard CV here. It IS applied in Part 4K's honest temporal (pre-cutoff aggregate rebuild), which is one reason the honest-temporal numbers are the better production estimate (§6.5).
 
 ### 8.4 Temporal drift
 
-WC top-5 is ~7 pts lower on recent placements vs older — triangulated between the approximate (4J, 8 pts) and honest (4K, 7.5 pts) temporal checks. Model generalises in principle but underperforms on bleeding-edge WC placements.
+WC top-5 drops ~7-8 pts between full-data CV and the honest temporal holdout — triangulated between the approximate (Part 4J) and honest (Part 4K) checks. Some of that is intrinsic drift (carrier appetite shifts); some is the §8.3 peer-leakage inflation of CV metrics. Honest-temporal is the production estimate.
 
 ### 8.5 Carrier consolidation inflates absolute metrics
 
 Group-level recommendations ("call Progressive") rather than sub-entity ("call Progressive Direct specifically"). Mitigated with sub-entity distance ranking (§5.3.5), but headline hit-rate numbers are measured at group level — sub-entity-level numbers would be lower. Baselines are measured on the same consolidated pool, so **model-vs-baseline lift is apples-to-apples**.
 
-### 8.6 Known structural quirks accepted
+### 8.6 Carrier consolidation is unvalidated
+
+The 78 hand-written regex rules + data-provider map (§5.2) collapse ~2,100 insurer strings into ~1,400 carrier groups. There is no held-out validation that any specific collapse is correct — if we incorrectly merged carriers A and B whose appetites differ, the shared group's aggregate becomes a weighted average that matches neither. For production: A/B test consolidation choices against broker-outcome data (`conversion_rate_by_consolidation_scheme`).
+
+### 8.7 Soft-negative sampling is temporally anachronistic
+
+Soft negatives are drawn randomly from the DOT's state carrier pool **as of the current data vintage**, not as of the positive's `effective_date`. A positive placement from 20 months ago is paired against carriers that only exist in the state today. The anachronism is small (the 24m `recent_events` window limits how far back positives can be), and tree ensembles don't learn tight temporal boundaries, but it's a methodological corner we don't close.
+
+### 8.8 Known structural quirks accepted
 
 - **GL / non-BMC-84 surety**: dropped from scope (§4.1).
 - **Texas Mutual** (TX WC state fund): included as mainstream TX WC because the data provider doesn't flag it as residual-market. Methodologically it IS the TX residual-market option — treat the model's WC/TX ranking with that context.
 - **Fronting carriers** (Southlake Specialty, Highlander Specialty, MS Transverse Specialty, Trisura): shells for MGUs/MGAs. The real risk-taker is behind them. Can't reliably un-front without an external map.
 
-### 8.7 No ground-truth validation available
+### 8.9 No ground-truth validation available
 
-All validation uses the same underlying data (observed placements) in different cuts. True validation would require operational outcomes from Rosella's broker team — "we called the top-100, how many converted?"
+All validation uses the same underlying data (observed placements) in different cuts. True validation would require operational outcomes from Rosella's broker team — "we called the top-100, how many converted?" This is the first-month investigation if the system goes into production (§9).
 
 ---
 
