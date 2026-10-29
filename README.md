@@ -796,10 +796,14 @@ Tied to `svc_voluntary_exit_ratio` to distinguish healthy growth from churn-driv
 ```
 DOT 859192 | rank 83/84 | actual=OBSIDIAN SPECIALTY INSURANCE COMPANY
            fleet=2 band=B2 hazmat=1 crashes=0 tenure=1.7y
-           top-3 recs: GREAT WEST (0.81) | TRAVELERS GRP (0.78) | IAT GRP (0.39)
+           top-3 recs: GREAT WEST (GREAT WEST CASUALTY CO) 0.81
+                    | TRAVELERS GRP (TRAVELERS INDEMNITY CO OF AMERICA) 0.78
+                    | IAT GRP (ACADIA INSURANCE CO) 0.39
 ```
 
 Interpretation: small-fleet CA DOT with hazmat exposure but no crashes, placed with a specialty surplus insurer. Three mainstream alternatives with high fit scores — strong candidate for first call.
+
+**Why group + sub-entity:** carrier consolidation is a two-level system. We train and rank at the **group level** (PROGRESSIVE GRP, TRAVELERS GRP) because that's where appetite signal is statistically reliable — individual sub-entities are often thin on data. But the broker needs to call a specific legal entity to actually place the risk. So for each recommended group, we attach the closest sub-entity by variance-weighted Euclidean distance on 10 appetite features (§5.3.5). The broker gets both the appetite insight at group level AND the actionable phone number at sub-entity level.
 
 ### 7.8 Multi-line bundling (Part 10A)
 
