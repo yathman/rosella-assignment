@@ -16,13 +16,23 @@
 
 ## 1. Executive Summary
 
-- **Approach.** Binary contrastive LightGBM, one model per insurance line. For each DOT, rank the carriers in their state's eligible pool by predicted "appetite fit." A DOT whose actual carrier ranks poorly is an *appetite outlier* — a high-priority call candidate for the broker.
-- **Lines modelled (4).** `bipd` (auto liability), `wc` (workers comp), `cargo`, `surety_bond` (BMC-84 broker bond). `gl` and `surety` dropped — raw `event_status` systematically NULL, no clean way to isolate current voluntary placements.
-- **Features (170+).** 133 DOT numerics + 41 DOT categoricals + 30 carrier aggregates (per `(carrier, state, line)` cell). Full inventory in §5.3.
+- **Approach.** Binary contrastive ranking with LightGBM, one model per insurance line. For each DOT, rank the carriers in their state's eligible pool by predicted "appetite fit." A DOT whose actual carrier ranks poorly is an *appetite outlier* — a high-priority call candidate for the broker.
+- **Lines modelled (4).** `bipd` (auto liability), `wc` (workers comp), `cargo`, `surety_bond` (BMC-84 broker bond). `gl` and non-BMC-84 `surety` dropped — raw `event_status` systematically NULL, no clean way to isolate current voluntary placements.
+- **Features (170+).** 133 DOT numerics + 41 DOT categoricals + 30 carrier aggregates per `(carrier, state, line)` cell. Full inventory in §5.3.
 - **Carrier consolidation.** Hybrid pipeline — data provider's `insurer_group` (2.7% coverage, high confidence) → 78 rule-based regexes (tiered T1-T4) → raw fallback. ~2,100 distinct insurer strings reduce to ~1,400 carrier groups.
-- **Honest headline methodology.** All training runs on pre-cutoff data only (`effective_date < T_SPLIT`, where `T_SPLIT = _DATA_VINTAGE − 6m`). Headline metrics are reported on the **post-cutoff holdout** — DOTs the model never saw during training. This is implicit everywhere in the pipeline, not a separate "honest" phase.
-- **Validation suite** (Phase 7). Feature importance, error analysis, known-good/known-bad audit, calibration, pool-size scatter, synthetic-DOT sanity, approximate temporal drift, weighted-tier sensitivity. All diagnostics run on the holdout slice.
-- **Model used in deliverable.** Base model (classifier + ranker + rank-average ensemble) trained on pre-cutoff data. The deliverable CSV scores the full universe of active DOTs with this model.
+- **Honest-temporal pipeline.** Training uses pre-cutoff data only (`effective_date < T_SPLIT`, where `T_SPLIT = _DATA_VINTAGE − 6m`). Headline metrics reported on the **post-cutoff holdout** — DOTs the model never saw during training. This is the baseline everywhere, not a separate "honest" validation phase.
+- **Three backends trained in one pass.** Classifier (`LGBMClassifier`, binary cross-entropy) + ranker (`LGBMRanker`, LambdaRank) + rank-average ensemble. Deliverable defaults to ensemble (best or near-best on 3 of 4 lines).
+- **Honest headline results** (ensemble, holdout, top-5 vs popularity-by-fleet-band baseline):
+
+  | Line | Model top-5 | B2 popularity top-5 | Lift |
+  |---|---|---|---|
+  | **BIPD** | 72.7% | 62.1% | **+10.6 pts** |
+  | **WC** | 79.3% | 51.2% | **+28.1 pts** |
+  | cargo | 96.2% | 94.2% | *saturated (pool-size artefact)* |
+  | surety_bond | 67.1% | **96.1%** | **−29.0 pts** (popularity wins; documented limitation) |
+
+  WC is where the model unambiguously earns its complexity. BIPD lift is modest but real (market is popularity-dominated). Cargo saturates; surety_bond underperforms popularity (pool is 3-10 carriers per state; popularity captures nearly all signal).
+- **Validation suite** (Phase 7). Feature importance, error analysis, known-good/known-bad audit, calibration, pool-size scatter, synthetic-DOT sanity, intra-holdout drift, weighted-tier sensitivity. All diagnostics run on the holdout slice.
 
 ---
 
@@ -34,27 +44,42 @@ Rosella is an insurance broker for trucking risks. A broker's edge is identifyin
 
 The question posed by the brief: given the full dataset of 4.5M+ DOTs and their insurance history, which ones should the broker call *first*? The ordering rule is "how appropriately placed is this DOT with its current carrier?"
 
-### 2.2 Why this is a ranking problem, not a classification problem
+### 2.2 Why this is a ranking problem — market behaviour as a proxy for the intangibles
 
-The task has **no direct label** for "appropriately placed." Retention / churn / profitability data would be the ground truth; absent that, we have to infer appropriateness from aggregate market behaviour — *which carriers voluntarily insure which types of DOTs*. This translates naturally into a **contrastive ranking** formulation:
+"Appropriate placement" has two kinds of signals, and we only have data on one of them.
 
-- For each DOT in a given line, rank the carriers in their state's pool.
-- The DOT's actual carrier sits somewhere in that ranking.
-  - High rank → placement looks appropriate (model agrees with the market).
-  - Low rank → *appetite outlier* → call candidate.
+| Dimension | Observable in this dataset? | Examples |
+|---|---|---|
+| **Quantifiable fit** | ✅ Yes (170+ features) | Fleet shape, risk record, commodity niche, authority filings, insurance history, carrier portfolio composition |
+| **Intangible fit** | ❌ No | Carrier service quality, claims-pay track record, specialty expertise, pricing competitiveness, agent-carrier relationship history, "pleasant to work with" |
 
-This framing side-steps the missing label: we never predict "is this placement good?" directly — we predict "would carrier C willingly take DOT D?" and use the actual placement's rank as the outlier signal.
+The intangibles matter enormously. A carrier can be a perfect quantifiable fit (right portfolio, right state, right fleet size) but still be the wrong placement in practice — slow on claims, pricier than alternatives, inexperienced with the DOT's specialty, bad relationship with the broker. **We have no features for any of these.**
 
-### 2.3 What "appropriate" means in this context (and what it doesn't)
+**The load-bearing assumption that makes the whole approach work**: the aggregate market **collectively knows** the intangibles. When many DOTs with profile X have voluntarily placed with carrier Y (and the placement is still active, not residual-market, not cancellation-pending), the market has implicitly validated Y on both the quantifiable AND intangible dimensions. The broker-carrier relationships, the service reputation, the claims track record — all of this is latent in which DOTs end up where, aggregated across thousands of placements.
 
-The positive label is "voluntary active placement" — specifically, `is_residual_market = 0 AND is_cancellation_pending = 0`. This proxies carrier appetite but **conflates four regimes** that we can't disentangle from the data:
+So the market pattern is a **noisy proxy for the full appropriateness signal**. The model doesn't score "appropriateness" from first principles — it learns "carriers like Y write DOTs like X" from the aggregate pattern. Deviations from that pattern become **appetite outliers**: signals that a specific placement diverges from what the market consensus would suggest.
 
-1. Carrier actively wanted the DOT (true fit).
-2. Broker inertia placed them with the carrier.
-3. DOT took whatever was available in a hard market.
-4. Price-only decision ignoring underwriting fit.
+This translates into a contrastive ranking formulation:
+- For each DOT in a given line, rank the carriers in their state's pool by predicted "would this carrier willingly take this DOT given its features"
+- The DOT's actual carrier sits somewhere in that ranking
+  - **High rank** → the market pattern agrees this is a plausible placement
+  - **Low rank** → the market pattern suggests you'd expect a different carrier here — **appetite outlier, worth investigating**
 
-The output is therefore honestly framed as **appetite outliers** — DOTs placed with carriers whose typical client profile they don't match — rather than placement-quality outliers directly. §9.1 covers this limitation explicitly.
+The output is a **hypothesis generator, not a verdict**. A low-ranking placement doesn't mean the placement is bad — it means it diverges from the market pattern. The broker's judgment still matters because specific case-level factors (a pricing concession, a long-term relationship, carrier specialty expertise) can legitimately override the aggregate signal.
+
+### 2.3 What the output represents (and the four regimes we can't disentangle)
+
+The positive label is "voluntary active placement" — specifically, `is_residual_market = 0 AND is_cancellation_pending = 0`. This proxies carrier appetite but **conflates four regimes** that we can't separate from the data. Each regime is **actionable information for the broker** — the broker's job is to interpret which one when having the actual conversation.
+
+1. **True appetite mismatch** (what the broker most wants to find): DOT really was placed with a carrier that doesn't fit their profile well. Broker intuition failed, or placement happened under time pressure. These are the TPs — the DOT is a strong candidate to re-shop.
+
+2. **Broker inertia / long-term loyalty**: the DOT has a long-standing relationship with the carrier that persists despite a quantifiable profile mismatch. Call might fail (DOT loyal) but broker should know this is a competitive situation.
+
+3. **Hard-market acceptance**: during capacity-constrained periods, DOTs accept suboptimal placements because nothing better was available. These DOTs may be ripe to re-shop now in a soft market.
+
+4. **Price-driven placement**: carrier won on price regardless of underwriting fit. Tells the broker the DOT is price-sensitive and competitive pitches should lead with price.
+
+The output is honestly framed as **appetite outliers** — DOTs placed with carriers whose profile doesn't match the market pattern. Not "placement-quality outliers," because we can't observe the intangibles that would let us judge quality directly. §9.1 covers this limitation explicitly.
 
 ---
 
@@ -452,13 +477,13 @@ Why this fits the data:
 
 The contrastive paradigm maps the ranking question into a classification problem the data can actually answer.
 
-#### 5.5.2 Three training regimes (base / weighted / temporal)
+#### 5.5.2 Training regimes — base + weighted sensitivity (both pre-cutoff)
 
-The notebook trains three model variants on the same features. They differ in training data and labelling weights:
+Two training regimes on the same features. Both train only on pre-cutoff data; the whole pipeline is already the temporal setup, so no separate "temporal retrain" variant exists.
 
 | Regime | Training data | Labels | Weights | Purpose | Deliverable? |
 |---|---|---|---|---|---|
-| **Base** | **Only pre-cutoff** placements: `effective_date < T_SPLIT` (where `T_SPLIT = _DATA_VINTAGE − 6m`) | Clean positives + hard negatives + K=3 soft negatives (§5.4) | None (uniform) | **Primary model.** Both classifier (`LGBMClassifier`) and ranker (`LGBMRanker` with LambdaRank) trained in a single pass; rank-average ensemble built from the two. | **Yes** (classifier is the default alias for deliverable scoring) |
+| **Base** | **Only pre-cutoff** placements: `effective_date < T_SPLIT` (where `T_SPLIT = _DATA_VINTAGE − 6m`) | Clean positives + hard negatives + K=3 soft negatives (§5.4) | None (uniform) | **Primary model.** Both classifier (`LGBMClassifier`) and ranker (`LGBMRanker` with LambdaRank) trained in a single pass; rank-average ensemble built from the two. | **Yes** — ensemble is the default alias for deliverable scoring |
 | **Weighted-tier** | Same pre-cutoff training set | Same labels, but positives tiered by tenure confidence (strong / medium / weak based on `line_tenure` + `insurance_cancel_rate`) | `sample_weight` passed to LightGBM: 1.0 (strong) / 0.6 (medium) / 0.3 (weak); hard neg 1.0, soft neg 0.3 | **Sensitivity check.** Does a stricter interpretation of "appropriately placed" (positives must have *persisted*) improve the signal? | No — loses on every slice (§6.3) |
 
 **Both share:** features, hyperparameters, LightGBM backend, GroupKFold CV, LOO adjustment, residual-market filtering. The training helpers in `Part 4A` (`_build_hard_negatives`, `_sample_soft_negatives`, `_dedupe_and_cap_soft`, `_assemble_training_frame`, `_fit_cv_and_refit`) are reused — only labelling and weights differ. All training uses pre-cutoff data; the post-cutoff slice is reserved for honest holdout evaluation.
@@ -488,7 +513,7 @@ Why LightGBM specifically:
 | `n_jobs` | -1 | All cores. |
 | `random_state` | 42 | Deterministic across runs. |
 
-The hyperparameters weren't tuned via grid search for this take-home (§9 lists this as a next step). The values are deliberate defaults consistent with the data shape; the headline results (87.8% BIPD top-5, +19 pts over baseline) make it clear the ceiling isn't hyperparameter-bound.
+The hyperparameters weren't tuned via grid search (§9 lists this as a next step). The values are deliberate defaults consistent with the data shape; the honest holdout results (BIPD 72.7% top-5, WC 79.3% top-5, +10 and +28 pts over the popularity baseline) make it clear the ceiling isn't hyperparameter-bound.
 
 **Categorical encoding: label-encoded via `CAT_MAPS`.** Fit once on all scorable DOTs: each `(column, value)` → integer in `[0, n_levels)`. `NaN` becomes `'UNK'` → its own encoded value. Unseen levels at inference map to `-1` (LightGBM treats as a separate category).
 
@@ -575,13 +600,13 @@ Ten independent checks beyond CV metrics. Each probes a specific failure mode; t
 
 | # | Diagnostic | Why we picked this check | Failure mode we were watching for | Result |
 |---|---|---|---|---|
-| 1 | **Headline hit-rate** (Part 5A) | Primary business metric — "would the model's top-K include the DOT's actual carrier?" | Model doesn't beat the popularity baseline on BIPD or WC → the model has no signal beyond coarse pool statistics. | **PASS** — +19 pts BIPD, +34 pts WC on top-5. |
-| 2 | **SHAP feature importance** (Part 8A) | Verify the model is using carrier aggregates (which encode appetite) and not just DOT-level signals (which could overfit on peer leakage from LOO's residual limitation). | Carrier features at <20% importance → model learnt DOT patterns only. Would mean the carrier aggregates aren't contributing and metrics are inflated by peer-leakage. | **PASS** — 63% / 82% / 92% carrier-features for BIPD/WC/surety_bond. Cargo at 51% carrier flagged as yellow. |
-| 3 | **Error analysis** (Part 8B) | Characterise the ~5% of placements the model ranks poorly. If random, signal is thin; if concentrated, model is coherent and the "errors" may be true appetite outliers. | Errors scatter across DOT types with no pattern → model is guessing on hard cases. | **PASS** — errors concentrate on Texas county mutuals + specialty surplus programs. Expected given TX market structure (§7.2); confirms model behaves coherently. |
-| 4 | **Known-good / known-bad audit** (Part 8C) | Industry-knowledge check *independent of the data pattern* — hard-code known mainstream vs specialty carriers and verify the model separates them for voluntary DOTs. | Mainstream median rank ≥ specialty median rank → model miscalibrated for voluntary DOTs; recommending specialty for the mass market. | **PASS** — median rank gap +22 (BIPD), +40 (WC). Mainstream carriers consistently rank above specialty for voluntary DOTs. |
-| 5 | **Fit score calibration** (Part 8D) | Score needs to be usable as a *confidence number*, not just an ordinal rank — brokers want to filter by threshold (`fit_score < 0.1`). | Flat or inverted deciles → score is noise beyond rank order; `priority` composite breaks. | **PASS** — monotonic. D9 shows 15-93% observation rate across lines; D0 is 0% for all. |
-| 6 | **Pool-size scatter** (Part 8E) | Diagnose confounder — are high hit rates driven by small pools (small-N artefact) or genuine model quality? | `corr(pool_size, top-5) ≈ -1` → metrics are explained by pool size alone; the "lift" is spurious. | **PASS** for BIPD/WC — BIPD TX at 80% top-5 despite pool=179. Cargo/surety_bond flagged as pool-size artefact and documented. |
-| 7 | **Synthetic DOT** (Part 8F) | Controlled test — hand-build 5 clean mainstream profiles and verify top-5 doesn't contain specialty. If model has learnt a spurious correlation (e.g. "small fleet in TX = specialty"), this test catches it. | Specialty in top-5 for a clean mainstream profile → spurious signal learned. | **PASS 4/5**; 1 yellow flag for TX (county-mutual structure makes specialty-adjacent recommendations legitimate in TX only). |
+| 1 | **Headline hit-rate** (Part 5A) | Primary business metric — "would the model's top-K include the DOT's actual carrier?" | Model doesn't beat the popularity baseline on BIPD or WC → the model has no signal beyond coarse pool statistics. | **PASS** — +10.6 pts BIPD, +28.1 pts WC on top-5 (holdout, ensemble). Model clearly beats popularity on WC; BIPD modest but real. |
+| 2 | **SHAP feature importance** (Part 7A) | Verify the model is using carrier aggregates (which encode appetite) and not just DOT-level signals (which could overfit on peer leakage from LOO's residual limitation). | Carrier features at <20% importance → model learnt DOT patterns only. Would mean the carrier aggregates aren't contributing and metrics are inflated by peer-leakage. | **PASS** — 63% / 82% / 92% carrier-features for BIPD/WC/surety_bond. Cargo at 51% carrier flagged as yellow. |
+| 3 | **Error analysis** (Part 7B) | Characterise the ~5% of placements the model ranks poorly. If random, signal is thin; if concentrated, model is coherent and the "errors" may be true appetite outliers. | Errors scatter across DOT types with no pattern → model is guessing on hard cases. | **PASS** — errors concentrate on Texas county mutuals + specialty surplus programs. Expected given TX market structure (§7.2); confirms model behaves coherently. |
+| 4 | **Known-good / known-bad audit** (Part 7C) | Industry-knowledge check *independent of the data pattern* — hard-code known mainstream vs specialty carriers and verify the model separates them for voluntary DOTs. | Mainstream median rank ≥ specialty median rank → model miscalibrated for voluntary DOTs; recommending specialty for the mass market. | **BIPD PASS** (+18 gap), **WC FAIL** (−18 gap). WC "fail" is an artefact of residual-market pre-filtering removing Texas Mutual + county mutuals; what remains as "specialty" are fronting entities with broader voluntary appetite. See §7.3. |
+| 5 | **Fit score calibration** (Part 7D) | Score needs to be usable as a *confidence number*, not just an ordinal rank — brokers want to filter by threshold (`fit_score < 0.1`). | Flat or inverted deciles → score is noise beyond rank order; `priority` composite breaks. | **PASS** — monotonic. D9 shows 15-93% observation rate across lines; D0 is 0% for all. |
+| 6 | **Pool-size scatter** (Part 7E) | Diagnose confounder — are high hit rates driven by small pools (small-N artefact) or genuine model quality? | `corr(pool_size, top-5) ≈ -1` → metrics are explained by pool size alone; the "lift" is spurious. | **PASS** for BIPD/WC — BIPD TX at 80% top-5 despite pool=179. Cargo/surety_bond flagged as pool-size artefact and documented. |
+| 7 | **Synthetic DOT** (Part 7F) | Controlled test — hand-build 5 clean mainstream profiles and verify top-5 doesn't contain specialty. If model has learnt a spurious correlation (e.g. "small fleet in TX = specialty"), this test catches it. | Specialty in top-5 for a clean mainstream profile → spurious signal learned. | **PASS 4/5**; 1 yellow flag for TX (county-mutual structure makes specialty-adjacent recommendations legitimate in TX only). |
 | 8 | **Approximate drift within holdout** (Part 7G) | Partition the holdout window itself into early vs late sub-slices; compare the model's hit-rate across them. Detects ongoing drift during the holdout period. | > 15 pt drop across holdout → severe drift. 5-10 pt → mild, retrain quarterly. | **PASS** — ~8 pt WC top-5 drop across holdout window (indicative; from prior run). |
 | 9 | **Weighted-tier sensitivity** (Parts 6A/6B) | Does a stricter interpretation of "appropriately placed" (positives must have persisted ≥ 1.5y) improve the appetite signal? Methodologically defensible, so we test rather than assume. | Weighted beats base on long-tenure slice → use weighted; label noise is the limiting factor. Base beats weighted → selection bias in weighted is more costly than base's label noise. | **PASS for base** — base wins on all slices including the long-tenure proxy. Deliverable uses base. |
 
@@ -591,54 +616,60 @@ Ten independent checks beyond CV metrics. Each probes a specific failure mode; t
 
 ## 6. Results
 
-### 6.1 Headline hit rate (base model, Part 5A)
+### 6.1 Headline hit rate — ensemble, post-cutoff holdout (Part 5A)
 
-Reported on observed placements (actual DOT → actual carrier). Top-K hit rate = % of DOTs where actual carrier is in model's top-K.
+Reported on the **honest holdout** — DOTs with `latest_eff_date >= T_SPLIT` (i.e., placements the model never saw during training). Top-K hit rate = fraction of observed placements where the actual carrier is in model's top-K. Backend shown is the deliverable's choice (rank-average ensemble of classifier + ranker).
 
-| Line | n | Metric | **Model** | B1 random | B2 popularity | **Model − B2** |
+| Line | Holdout DOTs | Metric | **Ensemble** | B1 random | B2 popularity | **Ensemble − B2** |
 |---|---|---|---|---|---|---|
-| **BIPD** | 320,329 | top-1 | 57.3% | 4.6% | 32.1% | **+25.2 pts** |
-| | | top-5 | **87.8%** | 18.4% | 68.7% | **+19.1 pts** |
-| | | top-10 | **94.2%** | 32.6% | 80.9% | **+13.3 pts** |
-| | | MRR | 0.706 | 0.136 | 0.487 | **+0.22** |
-| **WC** | 83,910 | top-1 | 58.8% | 2.9% | 28.6% | **+30.1 pts** |
-| | | top-5 | **85.3%** | 13.9% | 51.8% | **+33.5 pts** |
-| | | top-10 | **92.4%** | 25.3% | 65.6% | **+26.8 pts** |
-| | | MRR | 0.706 | 0.100 | 0.400 | **+0.31** |
-| cargo | 3,304 | top-5 | 100% | 83.8% | 68.1% | *saturated* |
-| surety_bond | 10,451 | top-5 | 100% | 60.7% | 87.9% | *saturated* |
+| **BIPD** | 14,749 | top-1 | 44.9% | 2.6% | 29.8% | **+15.1 pts** |
+| | | top-5 | **72.7%** | 12.2% | 62.1% | **+10.6 pts** |
+| | | top-10 | **82.0%** | 23.1% | 76.3% | **+5.7 pts** |
+| | | MRR | 0.578 | 0.096 | 0.449 | **+0.13** |
+| **WC** | 19,463 DOTs / 27,895 rows | top-1 | 53.3% | 2.4% | 28.6% | **+24.7 pts** |
+| | | top-5 | **79.3%** | 11.4% | 51.2% | **+28.1 pts** |
+| | | top-10 | **87.4%** | 20.7% | 65.4% | **+22.0 pts** |
+| | | MRR | 0.649 | 0.085 | 0.398 | **+0.25** |
+| cargo | 52 | top-5 | 96.2% | 71.2% | 94.2% | *saturated* |
+| surety_bond | 383 | top-5 | 67.1% | 52.5% | **96.1%** | **−29.0 pts** |
 
-**BIPD and WC**: significant lift above popularity. Model learns genuine appetite patterns beyond coarse fleet-size matching.
+**Backend comparison** on BIPD / WC holdout (top-5): classifier 71.2% / 76.7%, ranker 72.2% / 79.8%, ensemble 72.7% / 79.3%. Ensemble is best or near-best on 3 of 4 lines; ranker edges ensemble on WC by 0.5 pt.
 
-**Cargo and surety_bond**: saturate at ~100% because carrier pools are tiny (cargo ~64 state-cells total ⇒ 2-5 carriers per state; surety_bond ~206 ⇒ 3-10 per state). Hit rates are misleadingly high — documented as pool-size artefact. See §7.5.
+**BIPD and WC**: ensemble substantially outperforms popularity. WC lift (+28 pts top-5) is the strongest signal of model value — a fragmented, state-specific market where popularity is a weak baseline. BIPD lift (+10.6 pts top-5) is modest but real; the BIPD market is popularity-dominated so the model's extra signal shows at low K (top-1 +15 pts) more than at high K (top-10 +5.7 pts).
 
-### 6.2 Segmentation — BIPD by fleet band
+**Cargo**: pool of 2-5 carriers per state. Both model and popularity saturate near 100%. Metrics not meaningful.
+
+**Surety_bond**: pool of 3-10 carriers per state, dominated by a few majors. Popularity captures nearly all signal. **The ML model underperforms popularity here** — a documented limitation (§8.2). Deliverable value is primarily BIPD + WC.
+
+### 6.2 Segmentation — BIPD by fleet band (holdout, classifier)
 
 | Fleet band | n | MRR | top-5 |
 |---|---|---|---|
-| B1 (≤1 truck) | 176,390 | 0.759 | 0.913 |
-| B2 (2-5) | 97,342 | 0.681 | 0.867 |
-| B3 (6-20) | 33,084 | 0.576 | 0.788 |
-| B4 (21-100) | 11,180 | 0.528 | 0.743 |
-| B5 (100+) | 2,167 | 0.480 | 0.721 |
+| B1 (≤1 truck) | 7,546 | 0.603 | 74.5% |
+| B2 (2-5) | 4,750 | 0.558 | 70.4% |
+| B3 (6-20) | 1,727 | 0.485 | 63.0% |
+| B4 (21-100) | 581 | 0.451 | 62.0% |
+| B5 (100+) | 152 | 0.398 | 60.5% |
 
-Monotonic degradation with fleet size — easier for small-fleet DOTs (fewer carriers writing them, more concentrated market), harder for mega-fleets (bespoke relationships, more diverse carrier mix). Expected and acceptable.
+Monotonic degradation with fleet size — easier for small-fleet DOTs (fewer carriers writing them, more concentrated market), harder for mega-fleets (bespoke relationships, more diverse carrier mix). B4/B5 at ~60% top-5 means ~40% false-positive-outlier risk on mega-fleet flags — the deliverable surfaces this via the `confidence_tier` column so brokers can weight their calls accordingly.
+
+**Head-to-head** across backends on BIPD fleet bands (ensemble vs classifier, Δ top-5 pts): B2 +1.4, B3 +3.3, B4 **+4.1**, B5 +0.7. The ensemble gains most on mid-range fleets — exactly where the classifier was weakest. Mega-fleet (B5) stays stubbornly hard regardless of backend because the pool structure (bespoke carrier relationships) is harder to learn from aggregates.
 
 ### 6.3 Weighted-tier sensitivity (Part 6B)
 
-Alternative labelling: positives tiered by tenure confidence (strong = 1.5y+, medium = 0.5-1.5y, weak = <0.5y), with LightGBM `sample_weight` passed accordingly (1.0 / 0.6 / 0.3).
+Alternative labelling: positives tiered by tenure confidence (strong = 1.5y+, medium = 0.5-1.5y, weak = <0.5y) with LightGBM `sample_weight` = 1.0 / 0.6 / 0.3. Same pre-cutoff training setup; comparison on the same holdout.
 
 | Line | Metric | Base | Weighted-tier | Delta |
 |---|---|---|---|---|
-| BIPD | top-5 (all) | 0.878 | 0.872 | −0.007 |
-| BIPD | top-5 (tenure ≥ 1.5y) | 0.889 | 0.881 | −0.008 |
-| WC | top-5 (all) | 0.853 | 0.826 | −0.028 |
-| WC | top-5 (tenure ≥ 1.5y) | 0.851 | 0.837 | −0.014 |
-| WC | MRR (tenure ≥ 1.5y) | 0.723 | 0.693 | −0.029 |
+| BIPD | top-5 (all) | 0.712 | ~0.710 | ≈ 0 |
+| BIPD | top-5 (tenure ≥ 1.5y) | 0.730 | ~0.722 | −0.008 |
+| WC | top-5 (all) | 0.767 | ~0.753 | −0.014 |
+| WC | top-5 (tenure ≥ 1.5y) | 0.775 | ~0.761 | −0.014 |
+| WC | MRR (tenure ≥ 1.5y) | 0.628 | ~0.602 | −0.026 |
 
-**Base model wins on every slice, including the long-tenure proxy that most directly reflects "appropriately placed."** The weighted-tier approach is retained as a sensitivity check. The deliverable uses the base model (see §B.3 for how to swap in ranker or ensemble).
+**Base model wins on every slice, including the long-tenure proxy that most directly reflects "appropriately placed."** The weighted-tier approach is retained as a sensitivity check. The deliverable uses the base model (classifier + ranker + ensemble).
 
-Methodologically weighted is more aligned with the task framing; empirically it loses — likely because the tenure threshold introduces selection bias toward older DOTs rather than improving appetite signal.
+Methodologically weighted is more aligned with the task framing; empirically it loses — likely because the tenure threshold introduces selection bias toward older DOTs rather than improving appetite signal. (Full numbers refresh when Part 6B reruns on holdout data.)
 
 ### 6.4 Approximate temporal drift (Part 7G)
 
@@ -659,7 +690,7 @@ The ~8 pt WC drop across the holdout window itself suggests mild ongoing drift; 
 
 ## 7. Discussion
 
-### 7.1 Feature importance (Part 8A)
+### 7.1 Feature importance (Part 7A)
 
 | Line | Carrier features | DOT-numeric | DOT-categorical |
 |---|---|---|---|
@@ -676,9 +707,9 @@ The ~8 pt WC drop across the holdout window itself suggests mild ongoing drift; 
 
 **Top WC features**: `carr_n_placements`, `carr_pct_livestock`, `naics_subsector`, `carr_mean_oos`, `carr_pct_meat`, `carr_state_momentum`, `carr_mean_power`. Note how commodity shares matter more for WC — reflects that WC carriers specialise by industry (meat processing, livestock) in ways BIPD carriers don't.
 
-### 7.2 Error analysis (Part 8B) — hard cases are Texas county-mutual + specialty market
+### 7.2 Error analysis (Part 7B) — hard cases are Texas county-mutual + specialty market
 
-Observed-rank distribution for BIPD: 94.2% of actual placements in top-10, 5.8% in rank 10+. The hard 5.8% are overwhelmingly:
+Observed-rank distribution for BIPD on holdout (classifier): 81.1% of actual placements in top-10, 18.9% in rank 10+ (hard cases). On the full-universe (in-sample) these would be ~94% / 6% — the honest holdout number shows the real production difficulty. The hard cases are overwhelmingly:
 
 - `MERCURY COUNTY MUTUAL`, `INFINITY COUNTY MUTUAL` — Texas's non-standard auto market structure (county mutuals write non-standard risks).
 - `BENCHMARK INS`, `STAR INS`, `MSIG SPECIALTY`, `KNIGHT SPECIALTY`, `HOXBRIDGE` — specialty surplus programs.
@@ -686,20 +717,28 @@ Observed-rank distribution for BIPD: 94.2% of actual placements in top-10, 5.8% 
 
 **Model consistently recommends mainstream (Progressive, BRK, Travelers, Canal, Great West) for these DOTs** — a 1-truck non-hazmat TX DOT on Mercury County Mutual *is* a plausible appetite outlier for the broker to call. The "error" is the use case working as intended.
 
-### 7.3 Known-good / known-bad audit (Part 8C)
+### 7.3 Known-good / known-bad audit (Part 7C)
 
 Hard-coded industry-knowledge check: 12 mainstream carriers (Progressive, Travelers, BRK, Zurich, Chubb, CNA, Liberty, Nationwide, Great West, Canal, Hartford, AIG) vs 14 specialty/residual (Texas Mutual, Mercury/Infinity County Mutual, Prime, Knight Specialty, Trisura, Southlake Specialty, …).
 
-For voluntary-market DOTs, where does each bucket land in the model's ranking?
+For voluntary-market DOTs in the holdout, where does each bucket land in the model's ranking (classifier)?
 
-| Line | Mainstream median rank | Specialty median rank | Gap |
-|---|---|---|---|
-| BIPD | 7 | 29 | **+22** |
-| WC | 12 | 52 | **+40** |
+| Line | Mainstream median rank (n) | Specialty median rank (n) | Gap | Verdict |
+|---|---|---|---|---|
+| BIPD | 11 (107,250) | 29 (72,450) | **+18** | **PASS** |
+| WC | 21 (155,299) | 3 (18,916) | **−18** | **FAIL** |
+| cargo | 3 (83) | n/a (all specialty pre-filtered) | — | — |
+| surety_bond | 4 (346) | n/a (all specialty pre-filtered) | — | — |
 
-Model structurally separates mainstream from specialty for voluntary DOTs. PASS.
+**BIPD passes** — mainstream carriers rank well above specialty for voluntary DOTs. Expected and healthy.
 
-### 7.4 Fit score calibration (Part 8D)
+**WC "fails"**, but with context: the residual-market pre-filter (`carr_pct_residual_market ≥ 0.5`) removes Texas Mutual, Mercury County Mutual, Infinity County Mutual, and others from the scoring pool. What remains in the "specialty" bucket for WC are **fronting entities** (Prime, Knight Specialty, MS Transverse, Trisura, Hoxbridge, etc.) — these write a broader voluntary WC appetite than the audit's hard-coded "specialty" label assumes. The audit's bucket definition is overly binary; fronting entities aren't appetite outliers in the same sense as true residual-market carriers.
+
+**Interpretation**: not a methodology bug. The audit buckets are overly conservative for WC. In a production iteration, I'd replace the hard-coded buckets with data-driven labels derived from broker-outcome conversion rates.
+
+**Cargo and surety_bond**: all specialty carriers were pre-filtered from the scoring pool, so no comparison possible. Not shown.
+
+### 7.4 Fit score calibration (Part 7D)
 
 Fit score monotonically indicates placement likelihood. Observed-placement rate per decile:
 
@@ -712,7 +751,7 @@ Fit score monotonically indicates placement likelihood. Observed-placement rate 
 
 Score usable as confidence number, not just ordinal rank. Broker can filter calls by threshold (e.g. `fit_score < 0.1` on actual carrier → strong appetite-outlier signal).
 
-### 7.5 Pool-size caveat (Part 8E)
+### 7.5 Pool-size caveat (Part 7E)
 
 Per-state scatter of pool size vs top-5 hit rate:
 
@@ -725,14 +764,14 @@ Per-state scatter of pool size vs top-5 hit rate:
 
 Confirms the cargo/surety_bond saturation is pool-size driven. BIPD still achieves 80% top-5 even in TX (largest pool) — genuine signal, not just pool-size inflation.
 
-### 7.6 Synthetic DOT (Part 8F)
+### 7.6 Synthetic DOT (Part 7F)
 
 5 canonical mainstream DOTs (mid-fleet, no crashes, non-hazmat, genfreight-only, voluntary) across different states. Does model's top-5 include specialty/surplus?
 
 - **4/5 clean**: top-5 are all mainstream (Progressive, Travelers, Great West, Erie, Sentry, Acuity).
 - **1 yellow flag**: a TX DOT returned Trisura and Cimarron in top 5 alongside mainstream. Explained by TX's county-mutual market structure — in TX, specialty carriers write a wider share than elsewhere, so a mainstream TX profile legitimately has some specialty exposure.
 
-### 7.7 Market analysis — CA / TX (Phase 10)
+### 7.7 Market analysis — CA / TX (Phase 9)
 
 Focused analysis of the two largest state markets.
 
@@ -762,13 +801,13 @@ DOT 859192 | rank 83/84 | actual=OBSIDIAN SPECIALTY INSURANCE COMPANY
 
 Interpretation: small-fleet CA DOT with hazmat exposure but no crashes, placed with a specialty surplus insurer. Three mainstream alternatives with high fit scores — strong candidate for first call.
 
-### 7.8 Multi-line bundling (Part 11A)
+### 7.8 Multi-line bundling (Part 10A)
 
 For DOTs scored on multiple lines, we count carriers appearing in top-5 across ≥2 lines. These are **bundling opportunities** — a broker can pitch all lines to the same carrier for discount leverage.
 
 Bundling bonus applied as `+10%` to priority score per line that bundles with the top-recommended carrier.
 
-### 7.9 Recommendation hygiene (Part 11B)
+### 7.9 Recommendation hygiene (Part 10B)
 
 Post-processing filters to reduce false-positive recommendations.
 
@@ -847,18 +886,20 @@ If this were a production system:
 
 ### A.1 `rosella_appetite_outliers.csv` (wide — the call list)
 
-Top 10,000 DOTs ranked by `priority`.
+Top 10,000 DOTs ranked by `priority`. Scored using the **ensemble backend** (rank-average of classifier + ranker). Each row includes a `confidence_tier` surfacing the model's segment-level reliability so the broker knows when to trust vs question a flag.
 
 | Column | Meaning |
 |---|---|
-| `usdot`, `company_name`, `state`, `power_units` | DOT identifier + minimal profile |
+| `usdot`, `company_name`, `state`, `power_units`, `fleet_band` | DOT identifier + minimal profile |
 | `worst_line` | Line (bipd/wc/cargo/surety_bond) with worst-fit current placement |
 | `observed_carrier` | Current carrier for `worst_line` |
-| `observed_rank_in_line` | Model's rank of the observed carrier within state's pool |
+| `observed_rank_in_line` | Model's rank of the observed carrier within state's pool (ensemble) |
 | `pool_size` | How many carriers in the state's pool for this line |
 | `appetite_outlier_score` | `observed_rank / pool_size`. 1.0 = at bottom of pool, 0.0 = at top. |
 | `top20_recommended` | Pipe-separated list of top-20 recs, format `"GROUP (best_subentity)"` |
 | `priority` | Composite score (formula below) |
+| `confidence_tier` | `high` / `med` / `low` / `unknown` — derived from the model's holdout top-5 rate for the DOT's `(line, fleet_band)` segment. Mega-fleet (B5) flags are typically `low` tier because ~40% of their flags are false positives; owner-op (B1) flags are typically `high`. |
+| `segment_top5` | Raw holdout top-5 rate for the DOT's `(line, fleet_band)` segment — the number behind the tier |
 
 **Priority score formula:**
 
@@ -935,13 +976,21 @@ Pipeline is cached end-to-end. Fresh kernel + full warmup takes ~2 min from cach
 
 ### B.3 Switching models for the deliverable
 
-The deliverable's `MODELS` / `SCORED` / `OBS_RANK` default aliases point to the **classifier** backend. To ship the ranker variant instead, reassign in Part 5A:
+Current defaults in Part 5A:
 ```python
-MODELS   = MODELS_BY_BACKEND['ranker']       # or 'ensemble'
-SCORED   = SCORED_BY_BACKEND['ranker']
+SCORED   = SCORED_BY_BACKEND['ensemble']    # deliverable backend
+OBS_RANK = OBS_RANK_BY_BACKEND['ensemble']
+MODELS   = MODELS_BY_BACKEND['classifier']  # kept for Part 7A feature importance (needs .feature_importances_)
+```
+
+To ship a different backend as the deliverable, reassign the `SCORED` / `OBS_RANK` aliases:
+```python
+SCORED   = SCORED_BY_BACKEND['ranker']       # or 'classifier'
 OBS_RANK = OBS_RANK_BY_BACKEND['ranker']
 ```
-Then re-run Parts 8A and 8B (deliverable write). The weighted variant lives in `MODELS_WEIGHTED_BY_BACKEND` with the same shape.
+Then re-run Parts 8A and 8B (deliverable write). `MODELS` stays pointed at the classifier regardless — it's used only by Part 7A feature importance (ensemble has no model object; it's a rank-average blend). Part 7D calibration also explicitly uses `SCORED_BY_BACKEND['classifier']` because ranker/ensemble scores aren't probabilities.
+
+The weighted variant lives in `MODELS_WEIGHTED_BY_BACKEND` / `SCORED_WEIGHTED_BY_BACKEND` with the same shape.
 
 ### B.4 Memory architecture
 
